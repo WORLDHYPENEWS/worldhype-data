@@ -96,9 +96,16 @@ function imageFrom(item) {
 function domainOf(u) { try { return new URL(u).hostname.replace(/^www\./, ""); } catch { return "news"; } }
 
 function makeStory(cat, item) {
-  const title = (item.title || "").trim();
+  let title = (item.title || "").trim();
   const url = item.link || "";
   if (!title || !url || NON_LATIN.test(title)) return null;
+  // Google News titles end with " - Source"; pull the real source and clean the title.
+  let src = domainOf(url);
+  if (src === "news.google.com") {
+    const parts = title.split(" - ");
+    if (parts.length > 1) { src = parts.pop().trim(); title = parts.join(" - ").trim(); }
+  }
+  if (item.creator) src = item.creator;
   const raw = item["content:encoded"] || item.content || item.contentSnippet || item.summary || item.description || "";
   const body = clean(raw).slice(0, 1600) || title;
   const lo = ` ${title.toLowerCase()} ${body.toLowerCase()} `;
@@ -115,8 +122,8 @@ function makeStory(cat, item) {
     id: url,
     cat, sub: sub(cat, lo), tag: tg,
     sent: tg === "bull" ? "bull" : tg === "bear" ? "bear" : "neutral",
-    impact, title, src: (item.creator || domainOf(url)), author: item.creator || "",
-    body, url, imageUrl: imageFrom(item), imageCredit: domainOf(url),
+    impact, title, src, author: item.creator || "",
+    body, url, imageUrl: imageFrom(item), imageCredit: src,
     tickers, publishedAt: new Date(when).toISOString(),
   };
 }
@@ -126,6 +133,40 @@ async function pullRss(cat, url) {
     const feed = await parser.parseURL(url);
     return (feed.items || []).slice(0, MAX_PER_SOURCE).map((it) => makeStory(cat, it)).filter(Boolean);
   } catch (e) { console.log("skip", url, String(e.message || e)); return []; }
+}
+
+// Fetch a real preview image (og:image / twitter:image) for cards that have none.
+async function ogImage(url) {
+  try {
+    const res = await fetch(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "Mozilla/5.0 (compatible; WorldHypeNews/1.0)" },
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const html = (await res.text()).slice(0, 250000);
+    const pats = [
+      /<meta[^>]+property=["']og:image(?::url)?["'][^>]+content=["']([^"']+)["']/i,
+      /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+      /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+    ];
+    for (const p of pats) { const m = html.match(p); if (m && /^https?:\/\//.test(m[1])) return m[1].replace(/&amp;/g, "&"); }
+  } catch { /* ignore */ }
+  return null;
+}
+
+async function resolveImages(list, max = 160, conc = 12) {
+  const targets = list.filter((s) => !s.imageUrl).slice(0, max);
+  let i = 0, found = 0;
+  const worker = async () => {
+    while (i < targets.length) {
+      const s = targets[i++];
+      const img = await ogImage(s.url);
+      if (img) { s.imageUrl = img; found++; }
+    }
+  };
+  await Promise.all(Array.from({ length: conc }, worker));
+  console.log(`og:image resolved ${found}/${targets.length} imageless items`);
 }
 
 async function main() {
@@ -150,6 +191,8 @@ async function main() {
   const all = [...byId.values()]
     .sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt))
     .slice(0, MAX_ITEMS);
+
+  await resolveImages(all); // backfill preview images for cards that have none
 
   fs.writeFileSync(FEED_FILE, JSON.stringify(all));
   const counts = {};
